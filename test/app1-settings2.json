@@ -1,0 +1,14 @@
+{"application":{
+  "components": {
+    "back": {
+      "settings": {
+        "cpu": { "value": 0.5 }
+      }
+    },
+    "front": {
+      "settings": {
+        "cpu": { "value": 1 }
+      }
+    }
+  }
+}}

@@ -1,0 +1,318 @@
+#!/usr/bin/python3
+"""
+Optune 'adjust' driver for Skopos.
+
+(C) 2018, Opsani.
+
+use:
+adjust --version
+adjust --info
+adjust --query app_name
+adjust app_name <settings-file.json
+
+This script requires a configuration file placed at a fixed location (see DESC_FILE constant below). The file should contain the complete formatted reply to be sent in response to '--query' (see the TDR External Commands draft document), including default values for all settings (which should match the value the application would use in case the setting is not provided explicitly or is empty). In addition, the configuration file must contain a key 'driver', whose contents are a map in this form:
+driver:
+  skopos:
+     model: /root/example-twotier-app/skopos-ec2/model-v2.yaml # set this to the application's model file; this may be a remote reference (e.g., github://account/path/...).
+     teds: # a list of one or more environment files, some or all of them can be remote references:
+       - /root/skopos/tst/docker.ted
+
+NOTE: this script converts all component settings given to it on input to Skopos replacement variables in the form <componentName>_<settingName>. Global application settings are translated to application_<settingName>. Therefore, the model is expected to be instrumented with replacement variables prefixed with the component name plus an underscore or the string 'application_' for every setting that is to be controlled by this script. This is not enforced: if a setting is given that doesn't have a matching replacement variable, that setting will be lost.
+"""
+
+from __future__ import print_function    # py2 compatibility
+
+import sys
+
+import re
+import requests
+import json
+import yaml
+import signal
+
+# === constants
+DESC_FILE = "/app.yaml"
+sks_base_url = "http://localhost:8100/api/v1/"
+# FIXME: assume no login needed (plain HTTP connection, no auth - this fake auth header is used to tell the API that we're not a browser, so it doesn't require an origin token for CSRF protection)
+auth_hdr = {"Authorization":"Bearer auto"}
+
+
+class ApiError(Exception):
+    pass
+
+class DeployError(Exception): # raised when deploy ends in failed status
+    pass
+
+class ConfigError(Exception): # user-provided descriptor not readable
+    pass
+
+def sks_app(appname, qry):
+    '''GET operation on the api/v1/application entry points'''
+
+    # NOTE default for some requests is to return yaml, need to request json explicitly (TODO: add this option to the skopos CLI one day)
+    r = requests.get(sks_base_url + "applications/{}/{}".format(appname,qry), headers={"Accept":"application/json"})
+    if r.status_code == 400:
+        raise ApiError('Skopos API query failed for app "{}", query "{}": {}'.format(appname, qry, r.content)) # chk reason from reply body: FIXME
+    if not r.ok:
+        r.raise_for_status()
+    if r.status_code == 204: # no content
+        return {}
+    r = r.content
+    # need to convert to str first (in py3, r is bytes)
+    #return json.loads(str(r))  #FIXME: this doesn't work in py3
+    return json.loads(r.decode())
+
+
+def is_remote(name):
+    '''return true if name is in the form 'schema://...'
+    '''
+    return re.match("[a-z_]+://.+",name) is not None
+
+
+def read_desc():
+    '''load the user-defined application descriptor and all *local* model and env files referenced by it'''
+
+    try:
+        f = open(DESC_FILE)
+        d = yaml.load(f)
+    except IOError as e:
+        raise ConfigError("cannot read configuration from {}:{}".format(DESC_FILE,e.strerror))
+    except yaml.error.YAMLError as e:
+        raise ConfigError("syntax error in {}: {}".format(DESC_FILE,str(e)))
+    # everything else: crash
+
+    # find driver-specific config
+    cfg = d.get("driver",{}).get("skopos",{}) # TODO (future version) handle empty/absent config (get model/ted from skopos API)
+
+    # load files
+    if is_remote(cfg["model"]):
+        model = [cfg["model"],""]
+    else:
+        f = open(cfg["model"])
+        model = f.read() # not parsed (yaml.load(f)), we send it as text
+        model = [cfg["model"],model]
+
+    teds = []
+    for x in cfg["teds"]:
+        if is_remote(x):
+            ted = [x,""]
+        else:
+            f = open(x)
+            ted = f.read() #yaml.load(f)
+            ted = [x,ted]
+        teds.append(ted)
+
+    force_replace = cfg.get('force_replace', True)  #FIXME: change default to False
+
+    return d, model, teds, force_replace
+
+def query(appname, desc):
+    '''return app (adjust) description with current values of all settings'''
+    # NOTE this relies on the app to be in a 'final' state (i.e., the settings from the currently visible env have already been applied; check for this)
+
+    # get env from sks API
+    r = sks_app(appname,"environment?effective=1")
+
+    # read app description (we need the list of settings, it cannot be guessed from the vars map in the environment settings)
+#    if not desc:
+#        desc = ... for now we expect it's already loaded from file
+
+    vars_ = r.get("vars", {})
+    for n,vd in desc.get("application",{}).get("settings",{}).items():
+        vn = "application_"+n
+        if vn in vars_.items():
+            vd["value"] = vars_[vn]
+        #else: leave vd["value"] as-is assume default from the description (FIXME: check presence of this item, it is mandatory)
+
+
+    for cn, cd in desc.get("components",{}).items():
+        for n, vd in cd.get("settings",{}).items():
+            vn = cn+"_"+n
+            if vn in vars_:
+                vd["value"] = vars_[vn]
+            #else: leave vd["value"] as-is assume default from the description (FIXME: check presence of this item, it is mandatory)
+
+    return desc
+
+def wait_for_completion(appname, docver):
+    '''wait for in-progress app deploy/update and report progress to stdout'''
+
+# FIXME: timeout on the API calls (in case Skopos fell asleep)
+
+    ready_popped = False    # track whether we've seen ready
+    r = {}
+    q = "deployment" #1st time call with no query params
+    if docver:
+        q = "deployment?last_docver={}".format(docver)
+    while True:
+        r0 = sks_app(appname, q)
+        if not r0 and not r:
+            q = "deployment" # re-query without docver
+            continue
+        if r0:
+            docver = r0["docver"]
+            r = r0["deploystate"]
+        # else: keep 'r'
+        s = r["state"]
+        if s in ("completed","not-ready"): # deploy completed or no plan (app is up to date): we're done
+            return
+        if s == "failed": # oops
+            raise DeployError("update failed") # TODO: err info from dep. state
+        if s in ("gate-wait","error-wait","paused"):
+            print( json.dumps({"progress":r["progress"], "message": "WARNING: paused or blocked waiting for user input, state is {}".format(r["display_state"]), "msg_index":-1}) )
+            #FIXME: do we need to change q to include last_docver? @lion
+            continue
+        # NOTE: 'ready' state not expected
+        if s == "ready" and not ready_popped: # allow ready to be listed but not persist (FIXME consider if best approach)
+            print( json.dumps({"progress":r["progress"], "message": "WARNING: found unexpected \"ready\" state, ignoring it once", "msg_index":-1}) )
+            ready_popped = True
+        elif s != "running":
+            raise ApiError('unexpected app state "{}" while waiting for deploy to complete (app "{}")'.format(s, appname)) # all other states - not expected ; TODO: use a different err here?
+        # s == 'running': in progress - send progress update and wait again
+        print ( json.dumps({"progress":r["progress"]}) )
+        q = "deployment?last_docver={}".format(docver)
+    # end while
+
+
+
+def update(appname, data):
+    '''prepare new set of config settings and send an update to Skopos daemon. The application is expected to be either in 'completed' state (previous update done) or 'not-ready' state (app is up to date after re-plan). It could also be in 'failed' state, the load command is acceptable in this state (note previous settings can't be read in 'failed' state, any setting not explicitly given will be set to a default value).
+    '''
+
+    desc, model, teds, force_replace = read_desc()
+
+    # get app state
+    r = sks_app(appname, "deployment")
+    r = r["deploystate"]
+    if r["state"] == "failed":
+        # don't rely on data from Skopos, use only defaults
+        pass
+    elif r["state"] in ("completed","not-ready"):
+        desc = query(appname, desc) # for current values
+    else:
+        # TODO: take corrective action (agent might have been terminated while app was updating, etc.)
+        raise Exception('Unexpected app state: {}'.format(r['state'])) # TODO err type
+
+    # TODO: if model/env not read from file(s), take data from skopos API
+    # model = sks_app(appname, "model")
+    # env = sks_app(appname, "environment?effective=1")
+    # update env
+#    if "vars" not in env:
+#        env["vars"] = {}
+
+    # traverse the given data to get to app and component settings
+    #FIXME: make this fit a specification / make uniform
+    if 'state' in data:
+        data = data['state']
+
+    envvars = {}
+
+    for k,v in data.get("application",{}).get("settings",{}).items():
+        envvars["application_"+k] = str(v.get('value')) # skopos vars must be strings
+    for comp,cdata in data.get("application",{}).get("components",{}).items():
+        for k,v in cdata.get("settings",{}).items():
+            envvars[comp+"_"+k] = str(v.get('value')) # skopos vars must be strings
+
+    teds.append(["_adj_settings_",json.dumps({"vars":envvars})])
+    # prepare load request
+    # cwd (?), options (?), models[], [raw_models[]], teds[]
+    rq = {
+        "options":{"autonomy":"off", "replace_all":force_replace},
+        # NOTE: no way to control which components get replaced; not all Skopos plugins are able to remember config change, either - so set replace_all.
+        "models":[model],
+        "plans":[],
+        "teds":teds
+    }
+
+    # load
+    r = requests.post(sks_base_url + "applications/{}?action=init".format(appname), headers=auth_hdr, json=rq)
+    if not r.ok:
+        if r.status_code == 400: # api errors - respond with formatted message
+            # TODO: get err info (in most cases the API should respond with a JSON message)
+            raise ApiError("failed to load app into Skopos: {}".format(r.content))
+        else:
+            r.raise_for_status() # any other http failure: fatal
+
+    # start
+    global wait_in_progress
+    wait_in_progress = appname
+    r = requests.post(sks_base_url + "applications/{}/deployment?action=resume".format(appname), headers=auth_hdr, json={})  #TODO: why resume and not start?
+    if not r.ok:
+        if r.status_code == 400: # api errors - respond with formatted message
+            # TODO: get err info (in most cases the API should respond with a JSON message)
+            raise ApiError("could not start app update: {}".format(r.content))
+        else:
+            r.raise_for_status() # any other http failure: fatal
+
+    wait_for_completion(appname,0)
+
+    # if the above didn't raise an exception, all done (empty completion data, status 'ok')
+    print(json.dumps(dict(status='ok')))
+
+
+def cancel(signum,frame):
+    if not wait_in_progress:
+        sys_exit(1)
+    print ("aborting operation...",file=sys.stderr)
+    appname = wait_in_progress
+    # TBD: use pause first and no 'force' option, if the signal was SIGUSR1
+    r = requests.post(sks_base_url + "applications/{}/deployment?action=abandon".format(appname), headers=auth_hdr, json={"force":True})
+    # don't exit, wait for the abort to take effect
+    # FIXME: 'abandon' won't necessarily leave the app in a consistent state with a known configuration
+    # (maybe we can't support cancel correctly and shouldn't try - TBD)
+
+
+usage="""adjust --version
+adjust --info
+adjust --query appname
+adjust appname <settings.json
+"""
+version="1.0"
+
+if __name__ == "__main__":
+    wait_in_progress = None
+    signal.signal(signal.SIGUSR1, cancel)
+    signal.signal(signal.SIGTERM, cancel)
+    signal.signal(signal.SIGINT, cancel)
+
+    if len(sys.argv)<2:
+        sys.exit(usage)
+
+    if sys.argv[1]=="--version":
+        print(version)
+        sys.exit(0)
+
+    if sys.argv[1]=="--info":
+        print(json.dumps({"version":version, "has_cancel":True}))
+        sys.exit(0)
+
+    if sys.argv[1]=="--query":
+        if len(sys.argv)<3:
+            sys.exit(usage)
+        appname = sys.argv[2]
+        try:
+            d,_,_,_ = read_desc()
+        except ConfigError as e:
+            print(json.dumps({"error":"config", "class":"config", "message":str(e)}))
+            sys.exit(3)
+        d.pop("driver",None)
+        try:
+            r = query(appname,d)
+        except (ApiError,DeployError) as e:
+            print(json.dumps({"error":e.__class__.__name__, "class":"failure", "message":str(e)}))
+            sys.exit(3)
+        print(json.dumps(r))
+        sys.exit(0)
+
+    appname = sys.argv[1]
+    data = json.load(sys.stdin)
+    try:
+        update(appname,data)
+    except (ApiError,DeployError) as e:
+        print(json.dumps({"error":e.__class__.__name__, "class":"failure", "message":str(e)}))
+        sys.exit(3)
+    except ConfigError as e:
+        print(json.dumps({"error":"config", "class":"config", "message":str(e)}))
+        sys.exit(3)
+    # all other exceptions: default handler - stack trace and sys.exit(1)
+
