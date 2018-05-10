@@ -31,7 +31,7 @@ import yaml
 import signal
 
 # === constants
-DESC_FILE = "/app.yaml"
+DESC_FILE = "./app.yaml"
 sks_base_url = "http://localhost:8100/api/v1/"
 # FIXME: assume no login needed (plain HTTP connection, no auth - this fake auth header is used to tell the API that we're not a browser, so it doesn't require an origin token for CSRF protection)
 auth_hdr = {"Authorization":"Bearer auto"}
