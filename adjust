@@ -301,7 +301,7 @@ if __name__ == "__main__":
         except (ApiError,DeployError) as e:
             print(json.dumps({"error":e.__class__.__name__, "class":"failure", "message":str(e)}))
             sys.exit(3)
-        print(json.dumps(r))
+        print(json.dumps(dict(application=r)))
         sys.exit(0)
 
     appname = sys.argv[1]
