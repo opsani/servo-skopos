@@ -246,10 +246,6 @@ def update(appname, data):
 
     wait_for_completion(appname,0)
 
-    # if the above didn't raise an exception, all done (empty completion data, status 'ok')
-    print(json.dumps(dict(status='ok')))
-
-
 def cancel(signum,frame):
     if not wait_in_progress:
         sys_exit(1)
@@ -316,3 +312,5 @@ if __name__ == "__main__":
         sys.exit(3)
     # all other exceptions: default handler - stack trace and sys.exit(1)
 
+    # if the above didn't raise an exception, all done (empty completion data, status 'ok')
+    print(json.dumps(dict(status='ok')))
