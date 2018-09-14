@@ -31,8 +31,9 @@ import yaml
 import signal
 
 # === constants
-DESC_FILE = "./app.yaml"
-sks_base_url = "http://localhost:8100/api/v1/"
+DESC_FILE = "./config.yaml"
+DRIVER_NAME = "skopos"
+
 # FIXME: assume no login needed (plain HTTP connection, no auth - this fake auth header is used to tell the API that we're not a browser, so it doesn't require an origin token for CSRF protection)
 auth_hdr = {"Authorization":"Bearer auto"}
 
@@ -50,7 +51,8 @@ def sks_app(appname, qry):
     '''GET operation on the api/v1/application entry points'''
 
     # NOTE default for some requests is to return yaml, need to request json explicitly (TODO: add this option to the skopos CLI one day)
-    r = requests.get(sks_base_url + "applications/{}/{}".format(appname,qry), headers={"Accept":"application/json"})
+    r = requests.get(g_skopos_addr + "api/v1/applications/{}/{}".format(appname,
+                                                               qry), headers={"Accept": "application/json"})
     if r.status_code == 400:
         raise ApiError('Skopos API query failed for app "{}", query "{}": {}'.format(appname, qry, r.content)) # chk reason from reply body: FIXME
     if not r.ok:
@@ -81,8 +83,33 @@ def read_desc():
         raise ConfigError("syntax error in {}: {}".format(DESC_FILE,str(e)))
     # everything else: crash
 
+    # Valchk
+    assert(DRIVER_NAME in d), \
+        "Missing driver configuration: missing {} section".format(
+            DRIVER_NAME)
+
     # find driver-specific config
-    cfg = d.get("driver",{}).get("skopos",{}) # TODO (future version) handle empty/absent config (get model/ted from skopos API)
+    cfg = d[DRIVER_NAME]
+
+    if not "components" in cfg:
+        raise Exception(
+            "Missing driver configuration: Missing components key.")
+
+    if len(cfg["components"].keys()) < 1:
+        raise Exception(
+            "App descriptor error: must have at least one component")
+
+    assert("skopos_addr" in cfg and
+           isinstance(cfg["skopos_addr"], str)), \
+        "Missing or invalid driver configuration: skopos_addr"
+
+    assert("model" in cfg and
+           isinstance(cfg["model"], str)), \
+        "Missing or invalid driver configuration: model"
+
+    assert("teds" in cfg and
+           isinstance(cfg["teds"], list)), \
+        "Missing or invalid driver configuration: teds"
 
     # load files
     if is_remote(cfg["model"]):
@@ -104,35 +131,50 @@ def read_desc():
 
     force_replace = cfg.get('force_replace', True)  #FIXME: change default to False
 
-    return d, model, teds, force_replace
+    global g_skopos_addr
+    g_skopos_addr = cfg["skopos_addr"]
 
-def query(appname, desc):
+    if not g_skopos_addr.endswith('/'):
+        g_skopos_addr += '/'
+
+    if not g_skopos_addr.startswith('http'):
+        g_skopos_addr = 'http://' + g_skopos_addr
+
+    return cfg, model, teds, force_replace
+
+def query(appname, cfg):
     '''return app (adjust) description with current values of all settings'''
     # NOTE this relies on the app to be in a 'final' state (i.e., the settings from the currently visible env have already been applied; check for this)
 
     # get env from sks API
-    r = sks_app(appname,"environment?effective=1")
+    r = sks_app(appname, "environment?effective=1")
 
     # read app description (we need the list of settings, it cannot be guessed from the vars map in the environment settings)
-#    if not desc:
-#        desc = ... for now we expect it's already loaded from file
 
     vars_ = r.get("vars", {})
-    for n,vd in desc.get("application",{}).get("settings",{}).items():
+    for n, vd in cfg.get("application", {}).get("settings", {}).items():
         vn = "application_"+n
         if vn in vars_.items():
             vd["value"] = vars_[vn]
         #else: leave vd["value"] as-is assume default from the description (FIXME: check presence of this item, it is mandatory)
 
 
-    for cn, cd in desc.get("components",{}).items():
+    for cn, cd in cfg["components"].items():
         for n, vd in cd.get("settings",{}).items():
             vn = cn+"_"+n
             if vn in vars_:
                 vd["value"] = vars_[vn]
-            #else: leave vd["value"] as-is assume default from the description (FIXME: check presence of this item, it is mandatory)
+            else:
+                # print warning
+                m = "Warning: failed to find current value for setting {} " + \
+                    "of component {}, using default value from config"
+                m = m.format(n, cn)
+                print(m, file=sys.stderr)
 
-    return desc
+    return {
+        "components": cfg["components"],
+        "settings": cfg.get("application", {}).get("settings", {})
+    }
 
 def wait_for_completion(appname, docver):
     '''wait for in-progress app deploy/update and report progress to stdout'''
@@ -179,7 +221,7 @@ def update(appname, data):
     '''prepare new set of config settings and send an update to Skopos daemon. The application is expected to be either in 'completed' state (previous update done) or 'not-ready' state (app is up to date after re-plan). It could also be in 'failed' state, the load command is acceptable in this state (note previous settings can't be read in 'failed' state, any setting not explicitly given will be set to a default value).
     '''
 
-    desc, model, teds, force_replace = read_desc()
+    cfg, model, teds, force_replace = read_desc()
 
     # get app state
     r = sks_app(appname, "deployment")
@@ -188,7 +230,7 @@ def update(appname, data):
         # don't rely on data from Skopos, use only defaults
         pass
     elif r["state"] in ("completed","not-ready"):
-        desc = query(appname, desc) # for current values
+        desc = query(appname, cfg) # for current values
     else:
         # TODO: take corrective action (agent might have been terminated while app was updating, etc.)
         raise Exception('Unexpected app state: {}'.format(r['state'])) # TODO err type
@@ -225,7 +267,8 @@ def update(appname, data):
     }
 
     # load
-    r = requests.post(sks_base_url + "applications/{}?action=init".format(appname), headers=auth_hdr, json=rq)
+    r = requests.post(
+        g_skopos_addr + "api/v1/applications/{}?action=init".format(appname), headers=auth_hdr, json=rq)
     if not r.ok:
         if r.status_code == 400: # api errors - respond with formatted message
             # TODO: get err info (in most cases the API should respond with a JSON message)
@@ -236,7 +279,8 @@ def update(appname, data):
     # start
     global wait_in_progress
     wait_in_progress = appname
-    r = requests.post(sks_base_url + "applications/{}/deployment?action=resume".format(appname), headers=auth_hdr, json={})  #TODO: why resume and not start?
+    r = requests.post(g_skopos_addr + "api/v1/applications/{}/deployment?action=resume".format(
+        appname), headers=auth_hdr, json={})  # TODO: why resume and not start?
     if not r.ok:
         if r.status_code == 400: # api errors - respond with formatted message
             # TODO: get err info (in most cases the API should respond with a JSON message)
@@ -248,11 +292,12 @@ def update(appname, data):
 
 def cancel(signum,frame):
     if not wait_in_progress:
-        sys_exit(1)
+        sys.exit(1)
     print ("aborting operation...",file=sys.stderr)
     appname = wait_in_progress
     # TBD: use pause first and no 'force' option, if the signal was SIGUSR1
-    r = requests.post(sks_base_url + "applications/{}/deployment?action=abandon".format(appname), headers=auth_hdr, json={"force":True})
+    r = requests.post(g_skopos_addr + "api/v1/applications/{}/deployment?action=abandon".format(
+        appname), headers=auth_hdr, json={"force": True})
     # don't exit, wait for the abort to take effect
     # FIXME: 'abandon' won't necessarily leave the app in a consistent state with a known configuration
     # (maybe we can't support cancel correctly and shouldn't try - TBD)
@@ -287,13 +332,12 @@ if __name__ == "__main__":
             sys.exit(usage)
         appname = sys.argv[2]
         try:
-            d,_,_,_ = read_desc()
+            cfg,_,_,_ = read_desc()
         except ConfigError as e:
             print(json.dumps({"error":"config", "class":"config", "message":str(e)}))
             sys.exit(3)
-        d.pop("driver",None)
         try:
-            r = query(appname,d)
+            r = query(appname, cfg)
         except (ApiError,DeployError) as e:
             print(json.dumps({"error":e.__class__.__name__, "class":"failure", "message":str(e)}))
             sys.exit(3)
@@ -303,7 +347,7 @@ if __name__ == "__main__":
     appname = sys.argv[1]
     data = json.load(sys.stdin)
     try:
-        update(appname,data)
+        update(appname, data)
     except (ApiError,DeployError) as e:
         print(json.dumps({"error":e.__class__.__name__, "class":"failure", "message":str(e)}))
         sys.exit(3)
