@@ -76,7 +76,7 @@ def read_desc():
 
     try:
         f = open(DESC_FILE)
-        d = yaml.load(f)
+        d = yaml.safe_load(f)
     except IOError as e:
         raise ConfigError("cannot read configuration from {}:{}".format(DESC_FILE,e.strerror))
     except yaml.error.YAMLError as e:
